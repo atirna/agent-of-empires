@@ -1319,6 +1319,13 @@ pub async fn acp_prompt(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
+    // Reserved before any of the work below, because that work is the window a
+    // Stop pressed right after Enter races: the cancel reaches the command
+    // channel while this handler is still waking a dormant session, folding
+    // control state, or waiting on worker readiness. Held to the end of the
+    // handler so every early return releases it. See
+    // `Supervisor::begin_prompt_dispatch`.
+    let dispatch_guard = state.acp_supervisor.begin_prompt_dispatch(&id);
     let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
     {
         let instances = state.instances.read().await;
@@ -1425,14 +1432,35 @@ pub async fn acp_prompt(
     // races this handler's live worker for the provider API. See
     // `session::smart_rename` and #2348.
     match outcome {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(PromptDispatchResponse {
-                dispatch,
-                queued_id: None,
-            }),
-        )
-            .into_response(),
+        Ok(()) => {
+            // The prompt is away. If Stop was pressed while it was still in
+            // dispatch, the cancel was deferred rather than forwarded into the
+            // no-turn-in-flight branch; send it now so the agent sees
+            // prompt-then-cancel and ends the turn the user was looking at.
+            if dispatch_guard.take_pending_cancel() {
+                tracing::info!(
+                    target: "http.api.acp",
+                    session = %id,
+                    "applying a cancel that arrived while the prompt was in dispatch"
+                );
+                if let Err(e) = state.acp_supervisor.cancel_prompt(&id).await {
+                    tracing::warn!(
+                        target: "http.api.acp",
+                        session = %id,
+                        error = %e,
+                        "deferred cancel after prompt dispatch failed"
+                    );
+                }
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(PromptDispatchResponse {
+                    dispatch,
+                    queued_id: None,
+                }),
+            )
+                .into_response()
+        }
         Err(SendTurnError::SessionNotFound) => {
             (StatusCode::NOT_FOUND, "session not found").into_response()
         }
@@ -1578,6 +1606,18 @@ pub async fn acp_cancel(
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
         return resp;
+    }
+    // A prompt accepted moments ago may still be in dispatch. Forwarding the
+    // cancel now would take the no-prompt-in-flight branch and be lost when the
+    // prompt lands; latch it onto that dispatch instead, which sends it as soon
+    // as the prompt is away. Still 202: the cancel is accepted either way.
+    if state.acp_supervisor.cancel_during_prompt_dispatch(&id) {
+        tracing::info!(
+            target: "http.api.acp",
+            session = %id,
+            "cancel arrived during prompt dispatch; deferring until the prompt is away"
+        );
+        return StatusCode::ACCEPTED.into_response();
     }
     match state.acp_supervisor.cancel_prompt(&id).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),

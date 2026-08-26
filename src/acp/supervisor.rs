@@ -353,6 +353,50 @@ pub(crate) enum ResumeReservationOutcome {
     AlreadyPresent,
 }
 
+/// RAII reservation for a prompt that has been accepted but not yet handed to
+/// the agent. Held across the whole `acp_prompt` handler so the reservation
+/// cannot leak through any of its early returns.
+pub struct PromptDispatchGuard {
+    slots: Arc<std::sync::Mutex<HashMap<String, (u64, bool)>>>,
+    session_id: String,
+    generation: u64,
+    settled: bool,
+}
+
+impl PromptDispatchGuard {
+    /// Release the reservation and report whether a cancel arrived while the
+    /// prompt was in dispatch. Call this once the prompt is away: a `true`
+    /// means the caller owes the agent a `session/cancel` now.
+    pub fn take_pending_cancel(mut self) -> bool {
+        self.settled = true;
+        self.remove_if_current().unwrap_or(false)
+    }
+
+    /// Remove this guard's own reservation, returning its `cancel_requested`
+    /// flag. A generation mismatch means a later prompt replaced the slot, so
+    /// this guard must leave it alone.
+    fn remove_if_current(&self) -> Option<bool> {
+        let mut slots = self.slots.lock().expect("prompt dispatch mutex");
+        match slots.get(&self.session_id) {
+            Some(&(generation, cancel_requested)) if generation == self.generation => {
+                slots.remove(&self.session_id);
+                Some(cancel_requested)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Drop for PromptDispatchGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            // Bailed before dispatch, so no turn exists to cancel; drop any
+            // latched cancel with the reservation.
+            let _ = self.remove_if_current();
+        }
+    }
+}
+
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
     registry: Arc<Mutex<AgentRegistry>>,
@@ -392,6 +436,24 @@ pub struct Supervisor<S: BroadcastSink> {
     /// so its pre-insert check consumes the breadcrumb instead of
     /// finding an empty set.
     cancelled_resumes: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Prompts accepted by `acp_prompt` but not yet handed to the agent, keyed
+    /// by session id, carrying `(generation, cancel_requested)`.
+    ///
+    /// `POST /acp/prompt` answers 202 and then does real work (dormant wake,
+    /// instance lock, control-state fold, worker readiness) before the prompt
+    /// reaches the agent. `POST /acp/cancel` reaches the command channel almost
+    /// immediately. A user pressing Stop right after Enter therefore lands the
+    /// cancel FIRST: the connection loop takes its no-prompt-in-flight branch
+    /// and the agent clears its cancel flag when the prompt finally arrives, so
+    /// the turn runs to completion and the composer never returns to Send.
+    /// Measured at 78ms apart in CI. This reservation lets such a cancel latch
+    /// onto the pending dispatch instead, and the dispatch re-sends it once the
+    /// prompt is away, so the agent observes prompt-then-cancel in that order.
+    ///
+    /// The generation makes removal precise: a stale guard cannot clear a
+    /// reservation a later prompt installed.
+    prompt_dispatches: Arc<std::sync::Mutex<HashMap<String, (u64, bool)>>>,
+    prompt_dispatch_gen: Arc<std::sync::atomic::AtomicU64>,
     /// Per-agent install gate. claude-agent-acp lazy-installs its
     /// native binary on first ever run; two concurrent `session/new`
     /// calls against a partially-installed SDK race the install and
@@ -745,6 +807,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             next_seqs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_resumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancelled_resumes: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            prompt_dispatches: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            prompt_dispatch_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             warmed_up_agents: Arc::new(std::sync::Mutex::new(HashSet::new())),
             agent_warmup_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             worker_notify: Arc::new(tokio::sync::Notify::new()),
@@ -2698,6 +2762,50 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// nothing left to cancel by then, and the resumed worker starts
     /// idle, so answering the user's stop with an error was reporting a
     /// fault for an outcome they got. See #3401.
+    /// Reserve the window between accepting a prompt and handing it to the
+    /// agent, so a `session/cancel` arriving inside it latches onto this
+    /// dispatch rather than being swallowed. See `prompt_dispatches`.
+    ///
+    /// Dropping the returned guard without calling `take_pending_cancel`
+    /// clears the reservation, which is the correct answer for a handler that
+    /// bailed before dispatching: no turn ever started, so there is nothing to
+    /// cancel.
+    pub fn begin_prompt_dispatch(&self, session_id: &str) -> PromptDispatchGuard {
+        let generation = self
+            .prompt_dispatch_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        self.prompt_dispatches
+            .lock()
+            .expect("prompt dispatch mutex")
+            .insert(session_id.to_string(), (generation, false));
+        PromptDispatchGuard {
+            slots: Arc::clone(&self.prompt_dispatches),
+            session_id: session_id.to_string(),
+            generation,
+            settled: false,
+        }
+    }
+
+    /// Latch a cancel onto an in-flight prompt dispatch. Returns whether one
+    /// was pending; when it was, the caller must NOT forward the cancel now.
+    /// Forwarding it would hit the no-prompt-in-flight branch, which publishes
+    /// a synthetic `Stopped` for a turn that has not started and still leaves
+    /// the real turn uncancelled.
+    pub fn cancel_during_prompt_dispatch(&self, session_id: &str) -> bool {
+        let mut slots = self
+            .prompt_dispatches
+            .lock()
+            .expect("prompt dispatch mutex");
+        match slots.get_mut(session_id) {
+            Some(slot) => {
+                slot.1 = true;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
         match client.cancel_prompt().await {
@@ -5120,6 +5228,54 @@ cursor-acp-bridge = "agent acp"
     /// handle so the next `/acp/spawn` or `/acp/switch-agent`
     /// doesn't hit AlreadyRunning, and does NOT emit a synthetic
     /// AgentStartupError (which would flip the sidebar to Error).
+    /// A Stop pressed while `acp_prompt` is still working latches onto the
+    /// pending dispatch instead of being forwarded into the
+    /// no-prompt-in-flight branch, where the agent would clear it when the
+    /// prompt finally landed and the turn would run to completion.
+    #[test]
+    fn a_cancel_during_prompt_dispatch_is_deferred_to_the_dispatch() {
+        let sup = Supervisor::new(VecSink::new());
+
+        // No prompt in dispatch: nothing to latch onto, so the caller forwards
+        // the cancel as it always did.
+        assert!(!sup.cancel_during_prompt_dispatch("s1"));
+
+        let guard = sup.begin_prompt_dispatch("s1");
+        assert!(
+            sup.cancel_during_prompt_dispatch("s1"),
+            "a cancel inside the dispatch window latches"
+        );
+        assert!(
+            guard.take_pending_cancel(),
+            "the dispatch owes the agent a session/cancel"
+        );
+        assert!(
+            !sup.cancel_during_prompt_dispatch("s1"),
+            "the reservation is released once taken"
+        );
+
+        // A dispatch nobody cancelled owes nothing.
+        let quiet = sup.begin_prompt_dispatch("s2");
+        assert!(!quiet.take_pending_cancel());
+
+        // Bailing out before dispatch drops the reservation, so a later cancel
+        // is not silently attributed to a turn that never started.
+        let abandoned = sup.begin_prompt_dispatch("s3");
+        assert!(sup.cancel_during_prompt_dispatch("s3"));
+        drop(abandoned);
+        assert!(!sup.cancel_during_prompt_dispatch("s3"));
+
+        // A stale guard must not clear the reservation a later prompt made.
+        let first = sup.begin_prompt_dispatch("s4");
+        let second = sup.begin_prompt_dispatch("s4");
+        drop(first);
+        assert!(
+            sup.cancel_during_prompt_dispatch("s4"),
+            "the newer dispatch still owns the slot"
+        );
+        assert!(second.take_pending_cancel());
+    }
+
     #[tokio::test]
     async fn drain_skips_restart_when_stopped_rate_limited() {
         let sink = VecSink::new();
