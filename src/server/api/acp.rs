@@ -1434,8 +1434,8 @@ pub async fn acp_prompt(
     match outcome {
         Ok(()) => {
             // The prompt is away. If Stop was pressed while it was still in
-            // dispatch, the cancel was deferred rather than forwarded into the
-            // no-turn-in-flight branch; send it now so the agent sees
+            // dispatch, that cancel already went out ahead of the prompt, where
+            // the agent drops it on turn start; re-send it now so the agent sees
             // prompt-then-cancel and ends the turn the user was looking at.
             if dispatch_guard.take_pending_cancel() {
                 tracing::info!(
@@ -1607,17 +1607,24 @@ pub async fn acp_cancel(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    // A prompt accepted moments ago may still be in dispatch. Forwarding the
-    // cancel now would take the no-prompt-in-flight branch and be lost when the
-    // prompt lands; latch it onto that dispatch instead, which sends it as soon
-    // as the prompt is away. Still 202: the cancel is accepted either way.
+    // Latch the cancel onto any prompt still in dispatch, so it is re-sent once
+    // that prompt reaches the agent (the reordering fix), and then forward it
+    // now regardless.
+    //
+    // Forwarding unconditionally is what keeps this safe. Deferring instead
+    // loses the cancel whenever the handler holding the reservation exits
+    // without dispatching, and the most important such exit is the queued path:
+    // a prompt is queued precisely BECAUSE a turn is already running, so that
+    // is the case where Stop matters most. Sending now costs at worst a
+    // duplicate `session/cancel` in the race window, which the in-flight branch
+    // simply resends, plus the synthetic Stopped the no-turn branch already
+    // publishes today.
     if state.acp_supervisor.cancel_during_prompt_dispatch(&id) {
         tracing::info!(
             target: "http.api.acp",
             session = %id,
-            "cancel arrived during prompt dispatch; deferring until the prompt is away"
+            "cancel arrived during prompt dispatch; it will be re-sent once the prompt is away"
         );
-        return StatusCode::ACCEPTED.into_response();
     }
     match state.acp_supervisor.cancel_prompt(&id).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),

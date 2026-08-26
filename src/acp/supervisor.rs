@@ -390,8 +390,11 @@ impl PromptDispatchGuard {
 impl Drop for PromptDispatchGuard {
     fn drop(&mut self) {
         if !self.settled {
-            // Bailed before dispatch, so no turn exists to cancel; drop any
-            // latched cancel with the reservation.
+            // Bailed before dispatch, so there is no prompt for a latched
+            // cancel to be reordered against. Dropping the latch is safe only
+            // because `acp_cancel` already forwarded that cancel; a turn may
+            // well be running (the queued path is reached precisely when one
+            // is), and it must not be left running.
             let _ = self.remove_if_current();
         }
     }
@@ -2787,11 +2790,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
-    /// Latch a cancel onto an in-flight prompt dispatch. Returns whether one
-    /// was pending; when it was, the caller must NOT forward the cancel now.
-    /// Forwarding it would hit the no-prompt-in-flight branch, which publishes
-    /// a synthetic `Stopped` for a turn that has not started and still leaves
-    /// the real turn uncancelled.
+    /// Latch a cancel onto an in-flight prompt dispatch, so the dispatch
+    /// re-sends it once the prompt has reached the agent. Returns whether a
+    /// dispatch was pending.
+    ///
+    /// The caller forwards the cancel now as well, and must keep doing so: a
+    /// latch alone is lost whenever the reservation holder exits without
+    /// dispatching, and the queued path does exactly that while a turn is
+    /// already running.
     pub fn cancel_during_prompt_dispatch(&self, session_id: &str) -> bool {
         let mut slots = self
             .prompt_dispatches
@@ -5229,11 +5235,11 @@ cursor-acp-bridge = "agent acp"
     /// doesn't hit AlreadyRunning, and does NOT emit a synthetic
     /// AgentStartupError (which would flip the sidebar to Error).
     /// A Stop pressed while `acp_prompt` is still working latches onto the
-    /// pending dispatch instead of being forwarded into the
-    /// no-prompt-in-flight branch, where the agent would clear it when the
-    /// prompt finally landed and the turn would run to completion.
+    /// pending dispatch, so the dispatch re-sends it once the prompt has
+    /// reached the agent. Without that re-send the cancel lands first, the
+    /// agent clears it on turn start, and the turn runs to completion.
     #[test]
-    fn a_cancel_during_prompt_dispatch_is_deferred_to_the_dispatch() {
+    fn a_cancel_during_prompt_dispatch_is_resent_after_the_prompt() {
         let sup = Supervisor::new(VecSink::new());
 
         // No prompt in dispatch: nothing to latch onto, so the caller forwards
@@ -5247,7 +5253,7 @@ cursor-acp-bridge = "agent acp"
         );
         assert!(
             guard.take_pending_cancel(),
-            "the dispatch owes the agent a session/cancel"
+            "the dispatch owes the agent a re-sent session/cancel"
         );
         assert!(
             !sup.cancel_during_prompt_dispatch("s1"),
@@ -5264,6 +5270,19 @@ cursor-acp-bridge = "agent acp"
         assert!(sup.cancel_during_prompt_dispatch("s3"));
         drop(abandoned);
         assert!(!sup.cancel_during_prompt_dispatch("s3"));
+
+        // The queued path returns without dispatching while a turn is already
+        // running, so a latch taken there is dropped. That is only safe because
+        // `acp_cancel` forwards every cancel as well; this pins the drop so a
+        // future change back to deferring has to confront it.
+        let queued = sup.begin_prompt_dispatch("s5");
+        assert!(sup.cancel_during_prompt_dispatch("s5"));
+        drop(queued);
+        assert!(
+            !sup.cancel_during_prompt_dispatch("s5"),
+            "a latch dropped on a non-dispatch exit is gone, so the forward at \
+             cancel time is what stops the running turn"
+        );
 
         // A stale guard must not clear the reservation a later prompt made.
         let first = sup.begin_prompt_dispatch("s4");
