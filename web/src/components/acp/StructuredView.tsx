@@ -1583,7 +1583,16 @@ export function WorkingSpinner({
   const showForceEnd = !cancelling && !compacting && showStalled && !toolInFlight;
 
   return (
-    <div data-testid="acp-working-spinner" className="flex flex-col gap-2 text-sm italic text-text-muted">
+    // `data-thinking` mirrors the server-driven ThinkingStarted state. The
+    // spinner itself renders on the optimistic `running` flag, which flips the
+    // moment a prompt is submitted, so it is not evidence the daemon has a turn
+    // yet; the attribute is, and a live test needs that distinction before it
+    // can press Stop without racing the prompt dispatch.
+    <div
+      data-testid="acp-working-spinner"
+      data-thinking={thinking ? "true" : "false"}
+      className="flex flex-col gap-2 text-sm italic text-text-muted"
+    >
       <div className="flex items-center gap-2">
         <span className="inline-block w-3 text-center font-mono text-brand-500" aria-hidden="true">
           {SPINNER_FRAMES[frame]}

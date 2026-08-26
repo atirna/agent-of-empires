@@ -20,7 +20,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import { spawnAoeServe, listSessions, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
+import { spawnAoeServe, listSessions, seedSessionViaAoeAdd, waitForQueuedPrompts } from "../../helpers/aoeServe";
 import { enableStructuredViewAndWait, waitForStructuredView, attachServeDiagnostics } from "../../helpers/acp";
 
 const SCRIPT = {
@@ -97,6 +97,13 @@ base("queued follow-up fires after navigation away and back", async ({ page }, t
     await expect(queueBtn).toBeVisible({ timeout: 5_000 });
     await composerA.fill("from-after-nav");
     await queueBtn.click();
+
+    // `click()` resolves when the handler fires, not when the enqueue POST
+    // completes, and the `page.goto` below aborts anything still in flight.
+    // Observed in CI: `POST /acp/prompt` came back with status -1 (aborted) 17ms
+    // before the `/settings` navigation, so nothing was queued and turn 2 could
+    // never fire. Wait for the daemon to own the queued prompt first.
+    await waitForQueuedPrompts(serve.baseUrl, sessionA.id, 1);
 
     // Navigate away to settings (no structured view, no PTY), then back to A.
     // The StructuredView unmount/remount is what we want to exercise; the

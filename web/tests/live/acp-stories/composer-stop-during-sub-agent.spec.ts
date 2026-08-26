@@ -70,6 +70,14 @@ base("Stop button cancels a turn during a sub-agent task", async ({ page }, test
 
     const stopButton = page.getByTestId("composer-actions").getByRole("button", { name: "Stop" });
     await expect(stopButton).toBeVisible({ timeout: 10_000 });
+
+    // Same race as composer-stop-during-thinking: the Stop button rides the
+    // optimistic `running` flag and can be pressed before `POST /acp/prompt`
+    // reaches the agent, which loses the cancel and leaves the turn running for
+    // its full 30s. The parent Task row is rendered from the agent's own
+    // `tool_call` update, so waiting for it proves the prompt was dispatched and
+    // a cancel has a turn to land on.
+    await expect(page.getByText("Task: investigate")).toBeVisible({ timeout: 15_000 });
     await stopButton.click();
 
     await expect(page.getByRole("textbox", { name: /Send a message/i })).toBeVisible({ timeout: 10_000 });

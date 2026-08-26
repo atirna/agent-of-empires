@@ -64,6 +64,19 @@ base("Stop button cancels a thinking turn", async ({ page }, testInfo) => {
     // and the two matches fail Playwright's strict mode.
     const stopButton = page.getByTestId("composer-actions").getByRole("button", { name: "Stop" });
     await expect(stopButton).toBeVisible({ timeout: 10_000 });
+
+    // The Stop button appears on the optimistic `running` flag, which flips as
+    // soon as Enter is pressed, BEFORE `POST /acp/prompt` has been dispatched to
+    // the agent. Pressing Stop in that window sends `session/cancel` ahead of
+    // the prompt: the daemon takes its no-turn-in-flight path and the agent
+    // resets its cancel flag when the prompt finally lands, so the turn runs to
+    // completion (30s here) and the composer never returns to "Send a message".
+    // Observed in CI with the two POSTs 78ms apart. `data-thinking="true"` comes
+    // from the server's ThinkingStarted, so it proves the daemon owns a turn
+    // that a cancel can actually reach.
+    await expect(page.locator('[data-testid="acp-working-spinner"][data-thinking="true"]')).toBeVisible({
+      timeout: 15_000,
+    });
     await stopButton.click();
 
     await expect(page.getByRole("textbox", { name: /Send a message/i })).toBeVisible({ timeout: 10_000 });

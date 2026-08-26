@@ -186,6 +186,40 @@ export async function listSessions(
 }
 
 /**
+ * Poll `GET /api/sessions/{id}/queue` until it holds `expected` prompts.
+ *
+ * The composer's queue button posts to `/acp/prompt` and the daemon answers
+ * `disposition: "queued"`; the click resolves as soon as the button handler
+ * fires, NOT when that POST completes. A `page.goto` issued straight after the
+ * click therefore aborts the request mid-flight (Chromium reports the abort as
+ * `Failed to fetch`), nothing is ever queued, and the turn-end drain has
+ * nothing to deliver. Wait on the server's own queue snapshot before
+ * navigating.
+ */
+export async function waitForQueuedPrompts(
+  baseUrl: string,
+  sessionId: string,
+  expected: number,
+  timeout = 15_000,
+): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const res = await fetch(`${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}/queue`);
+        if (!res.ok) throw new Error(`GET /queue failed: ${res.status}`);
+        const body = await res.json();
+        return Array.isArray(body) ? body.length : (body?.queued_prompts?.length ?? 0);
+      },
+      {
+        timeout,
+        intervals: [100, 200, 400],
+        message: `session ${sessionId} should hold ${expected} queued prompt(s) within ${timeout}ms`,
+      },
+    )
+    .toBe(expected);
+}
+
+/**
  * Poll `GET /api/sessions` until at least one session is present, and
  * return the snapshot the poll settled on. The list is a cache the
  * daemon reconciles on a 2s tick (see `waitForView` below), so a fresh
